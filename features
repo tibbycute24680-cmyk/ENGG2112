@@ -1,0 +1,144 @@
+import pandas as pd
+import numpy as np
+
+# ── Load merged data ───────────────────────────────────────────────────────────
+df = pd.read_csv("2023_merged_dataset1.csv")
+
+
+def parse_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    # 'HH:MM' string -> integer
+    # "09:00" -> 9
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["hour"] = df["hour"].astype(str).str.split(":").str[0].astype(int)
+    return df
+
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    All features encoded as integers or floats — no strings, no object columns.
+    """
+    df = df.copy()
+
+    # ── Datetime components ────────────────────────────────────────────────────
+    df["day_of_week"] = df["date"].dt.dayofweek       # 0 = Monday, 6 = Sunday
+    df["month"]       = df["date"].dt.month            # 1–12
+    df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
+
+    # ── Day / Night  (06:00–19:59 = day) ──────────────────────────────────────
+    df["is_day"] = ((df["hour"] >= 6) & (df["hour"] < 20)).astype(int)
+
+    # ── Season as integer ─────
+    # 0=Winter, 1=Spring, 2=Summer, 3=Fall
+    season_map = {12: 0, 1: 0, 2: 0,
+                   3: 1, 4: 1, 5: 1,
+                   6: 2, 7: 2, 8: 2,
+                   9: 3, 10: 3, 11: 3}
+    df["season"] = df["month"].map(season_map)
+
+    # ── Cyclical encoding ──────────────────────────────────────────────────────
+    # Lets XGBoost know hour 23 and hour 0 are adjacent
+    df["hour_sin"]        = np.sin(2 * np.pi * df["hour"]        / 24)
+    df["hour_cos"]        = np.cos(2 * np.pi * df["hour"]        / 24)
+    df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7)
+    df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7)
+    df["month_sin"]       = np.sin(2 * np.pi * df["month"]       / 12)
+    df["month_cos"]       = np.cos(2 * np.pi * df["month"]       / 12)
+
+    # ── Airport: label encode string -> integer ────────────────────────────────
+    df["airport_code"] = df["airport"].astype("category").cat.codes
+
+    # ── Weather-derived features ───────────────────────────────────────────────
+    HEAT_THRESHOLD = 35   # °C — adjust per airport cluster (PHX/LAS vs SEA/PDX)
+    df["temp_squared"]    = df["temperature"] ** 2
+    df["is_extreme_heat"] = (df["temperature"] > HEAT_THRESHOLD).astype(int)
+    df["is_raining"]      = (df["precipitation"] > 0).astype(int)
+
+    # ── Flight features ────────────────────────────────────────────────────────
+    df["net_flow"] = df["Arrivals"] - df["Departures"]
+
+    # ── Holidays ───────────────────────────────────────────────────────────────
+    try:
+        from pandas.tseries.holiday import USFederalHolidayCalendar
+        cal      = USFederalHolidayCalendar()
+        holidays = cal.holidays(start=df["date"].min(), end=df["date"].max())
+        df["is_holiday"] = df["date"].dt.normalize().isin(holidays).astype(int)
+    except Exception:
+        df["is_holiday"] = 0
+
+    # ── Interaction features ───────────────────────────────────────────────────
+    df["temp_x_hour"]        = df["temperature"]    * df["hour"]
+    df["flights_x_hour"]     = df["TotalFlights"]   * df["hour"]
+    df["temp_x_flights"]     = df["temperature"]    * df["TotalFlights"]
+    df["holidays_x_flights"] = df["is_holiday"]     * df["TotalFlights"]
+
+    return df
+
+
+def add_lag_features(df: pd.DataFrame,
+                     load_col: str = "egse_percent_demand_0_5") -> pd.DataFrame:
+    """
+    Lag and rolling features grouped per airport.
+    Sorted by airport + date + hour to ensure correct temporal ordering.
+    NaNs from lagging are kept
+    """
+    df = df.sort_values(["airport", "date", "hour"]).copy()
+    g  = df.groupby("airport")
+
+    # ── Energy load lags ───────────────────────────────────────────────────────
+    for lag in [1, 2, 24, 168]:
+        df[f"load_t-{lag}"] = g[load_col].shift(lag)
+
+    # ── Rolling stats on load ──────────────────────────────────────────────────
+    # shift(1) before rolling prevents current hour leaking into its own window
+    df["rolling_mean_3h"]  = g[load_col].transform(lambda x: x.shift(1).rolling(3).mean())
+    df["rolling_mean_24h"] = g[load_col].transform(lambda x: x.shift(1).rolling(24).mean())
+    df["rolling_std_24h"]  = g[load_col].transform(lambda x: x.shift(1).rolling(24).std())
+
+    # ── Weather lags ───────────────────────────────────────────────────────────
+    df["temp_t-1"] = g["temperature"].shift(1)
+    df["temp_t-3"] = g["temperature"].shift(3)
+
+    # ── Flight lags ────────────────────────────────────────────────────────────
+    df["flights_t-1"]  = g["TotalFlights"].shift(1)
+    df["flights_t-24"] = g["TotalFlights"].shift(24)
+
+    # ── Flight rolling ─────────────────────────────────────────────────────────
+    df["flights_rolling_mean_3h"] = (
+        g["TotalFlights"].transform(lambda x: x.shift(1).rolling(3).mean())
+    )
+
+    return df
+
+
+def prepare_for_xgboost(df: pd.DataFrame,
+                         target_col: str = "egse_percent_demand_0_5") -> tuple[pd.DataFrame, pd.Series]:
+
+    # All 5 demand columns — drop the 4 that aren't the target
+    all_demand_cols = [
+        "egse_percent_demand_0_1",
+        "egse_percent_demand_0_25",
+        "egse_percent_demand_0_5",
+        "egse_percent_demand_0_75",
+        "egse_percent_demand_1",
+    ]
+    other_demand_cols = [c for c in all_demand_cols if c != target_col]
+
+    cols_to_drop = [
+        "date",      # replaced by day_of_week, month, cyclical features
+        "airport",   # replaced by airport_code
+        "hour",      # replaced by hour_sin / hour_cos
+        *other_demand_cols,
+    ]
+    cols_to_drop = [c for c in cols_to_drop if c in df.columns]
+    df = df.drop(columns=cols_to_drop)
+
+    y = df[target_col]
+    X = df.drop(columns=[target_col])
+
+    # Guard: any remaining object column will crash XGBoost
+    object_cols = X.select_dtypes(include="object").columns.tolist()
+    if object_cols:
+        raise ValueError(f"Object columns still present — fix before training: {object_cols}")
+
+    return X, y
