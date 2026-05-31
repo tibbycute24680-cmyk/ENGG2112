@@ -1,1 +1,2 @@
-The files in the data engineering branch should be run first
+The files may not show up in Github, and show an error. This is a Github rendering issue. You can just download the file and open it up in an IDE.
+The files in the data engineering branch should be run first, especially the data files. This is because the files in the main branch will use and refer to these files. The xgboost_code will create versions of the model and go through tuning and evluation.
